@@ -5,10 +5,12 @@ from torchvision import models, transforms
 from PIL import Image
 import os
 import shutil
+import zipfile
 import numpy as np
 from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
+import tempfile
 
 # Page configuration
 st.set_page_config(
@@ -19,7 +21,7 @@ st.set_page_config(
 
 # Application title and description
 st.title("📄 Document Type Classifier")
-st.markdown("Upload images of documents or process an entire folder to classify them by document type and layout.")
+st.markdown("Upload a single zip file (under 200MB) containing images to classify them by document type and layout, then download the results as a zip.")
 
 # Model configurations
 class BMDConfig:
@@ -139,24 +141,37 @@ def predict_layout(model, image):
                      for i in range(len(LayoutConfig.class_names))}
     return predicted_class, confidence, all_probs
 
-# Folder processing
-def process_folder(bmd_model, layout_model, input_folder, output_folder, confidence_threshold=50.0):
+# Process single zip file
+def process_zip(bmd_model, layout_model, zip_file, output_folder, confidence_threshold=50.0):
     output_base = os.path.join(output_folder, "Classified_Documents")
     os.makedirs(output_base, exist_ok=True)
     
     bmd_results = {"total": 0, "processed": 0, 
-                  "class_counts": {name: 0 for name in BMDConfig.class_names}, 
-                  "file_results": []}
+                   "class_counts": {name: 0 for name in BMDConfig.class_names}, 
+                   "file_results": []}
     
     layout_results = {"total": 0, "processed": 0, "skipped": 0, 
-                     "class_counts": {name: 0 for name in LayoutConfig.class_names}, 
-                     "uncertain": 0, "file_results": []}
+                      "class_counts": {name: 0 for name in LayoutConfig.class_names}, 
+                      "uncertain": 0, "file_results": []}
     
-    image_files = [f for f in Path(input_folder).glob('**/*') 
-                  if f.suffix.lower() in set(BMDConfig.supported_extensions)]
+    if not zip_file:
+        return bmd_results, layout_results, "No zip file uploaded.", output_base
+    
+    if zip_file.size > 200 * 1024 * 1024:  # 200MB in bytes
+        return bmd_results, layout_results, f"Zip file too large ({zip_file.size / (1024*1024):.2f}MB). Max size is 200MB.", output_base
+    
+    # Extract zip to a temp directory
+    temp_extract_dir = tempfile.mkdtemp()
+    with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+        zip_ref.extractall(temp_extract_dir)
+    
+    # Gather all image files
+    image_files = [os.path.join(root, f) for root, _, files in os.walk(temp_extract_dir) 
+                   for f in files if f.lower().endswith(tuple(BMDConfig.supported_extensions))]
     
     if not image_files:
-        return bmd_results, layout_results, "No supported image files found."
+        shutil.rmtree(temp_extract_dir)
+        return bmd_results, layout_results, "No supported image files found in zip.", output_base
     
     bmd_results["total"] = len(image_files)
     layout_results["total"] = len(image_files)
@@ -169,7 +184,7 @@ def process_folder(bmd_model, layout_model, input_folder, output_folder, confide
     
     for i, img_path in enumerate(image_files):
         progress_bar.progress((i + 1) / len(image_files))
-        status_text.text(f"Processing {i+1}/{len(image_files)}: {img_path.name}")
+        status_text.text(f"Processing {i+1}/{len(image_files)}: {os.path.basename(img_path)}")
         
         try:
             image = Image.open(img_path).convert('RGB')
@@ -182,7 +197,7 @@ def process_folder(bmd_model, layout_model, input_folder, output_folder, confide
                     bmd_results["processed"] += 1
                     bmd_results["class_counts"][bmd_class_name] += 1
                     bmd_results["file_results"].append({
-                        'file': str(img_path), 
+                        'file': img_path, 
                         'prediction': bmd_class_name,
                         'confidence': bmd_confidence
                     })
@@ -192,13 +207,14 @@ def process_folder(bmd_model, layout_model, input_folder, output_folder, confide
                         if layout_class is not None:
                             layout_class_name = LayoutConfig.class_names[layout_class]
                             layout_file_result = {
-                                "file": str(img_path),
+                                "file": img_path,
                                 "bmd_class": bmd_class_name
                             }
                             
                             target_folder = os.path.join(output_base, bmd_class_name)
                             if layout_confidence >= confidence_threshold:
-                                dest_path = os.path.join(target_folder, layout_class_name, img_path.name)
+                                dest_path = os.path.join(target_folder, layout_class_name, os.path.basename(img_path))
+                                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
                                 shutil.copy2(img_path, dest_path)
                                 layout_results["processed"] += 1
                                 layout_results["class_counts"][layout_class_name] += 1
@@ -208,7 +224,8 @@ def process_folder(bmd_model, layout_model, input_folder, output_folder, confide
                                     "confidence": f"{layout_confidence:.2f}%"
                                 })
                             else:
-                                dest_path = os.path.join(target_folder, "uncertain", img_path.name)
+                                dest_path = os.path.join(target_folder, "uncertain", os.path.basename(img_path))
+                                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
                                 shutil.copy2(img_path, dest_path)
                                 layout_results["uncertain"] += 1
                                 layout_file_result.update({
@@ -221,17 +238,25 @@ def process_folder(bmd_model, layout_model, input_folder, output_folder, confide
         except Exception as e:
             layout_results["skipped"] += 1
             layout_results["file_results"].append({
-                'file': str(img_path), 
+                'file': img_path, 
                 'error': str(e)
             })
     
-    return bmd_results, layout_results, f"Processed {len(image_files)} files."
+    shutil.rmtree(temp_extract_dir)
+    return bmd_results, layout_results, f"Processed {len(image_files)} files from zip.", output_base
+
+# Create a zip file from a folder
+def create_zip_from_folder(folder_path, zip_name):
+    temp_zip_dir = tempfile.mkdtemp()
+    zip_path = os.path.join(temp_zip_dir, zip_name)
+    shutil.make_archive(zip_path.replace('.zip', ''), 'zip', folder_path)
+    return zip_path + '.zip'
 
 # Main application
 def main():
     bmd_model, layout_model = load_models()
     
-    tab1, tab2, tab3 = st.tabs(["Upload Single Image", "Process Folder", "About"])
+    tab1, tab2, tab3 = st.tabs(["Upload Single Image", "Process Zip", "About"])
     
     with st.sidebar:
         st.subheader("Model Settings")
@@ -274,59 +299,69 @@ def main():
                         st.pyplot(fig)
 
     with tab2:
-        col1, col2 = st.columns(2)
-        with col1:
-            input_folder = st.text_input("Input Folder Path", "D:\\Image Sample\\Image Sample\\Bap-Table")
-        with col2:
-            output_folder = st.text_input("Output Folder Path", "C:\\codes\\DENIN")
+        st.subheader("Upload Zip File")
+        st.markdown("Upload a single zip file containing images (max 200MB).")
+        zip_file = st.file_uploader("Upload a zip file", type=["zip"])
+        
+        output_folder = tempfile.mkdtemp()
+        st.write(f"Output will be processed in a temporary folder: {output_folder}")
         
         confidence_threshold = st.slider("Confidence Threshold for Layout (%)", 0.0, 100.0, 50.0)
-        process_button = st.button("Process Folder", disabled=not (input_folder and output_folder))
+        process_button = st.button("Process Zip", disabled=not zip_file)
         
         if process_button:
-            if not os.path.exists(input_folder):
-                st.error("Input folder does not exist!")
-            else:
-                global progress_bar, status_text
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                bmd_results, layout_results, message = process_folder(
-                    bmd_model if use_bmd else None,
-                    layout_model if use_layout else None,
-                    input_folder, 
-                    output_folder, 
-                    confidence_threshold
-                )
-                st.success(message)
+            global progress_bar, status_text
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            bmd_results, layout_results, message, output_base = process_zip(
+                bmd_model if use_bmd else None,
+                layout_model if use_layout else None,
+                zip_file,
+                output_folder,
+                confidence_threshold
+            )
+            st.success(message)
+            
+            if use_bmd and bmd_model and bmd_results["file_results"]:
+                st.subheader("BMD Classification Summary")
+                st.write(f"Total Documents Processed: {bmd_results['processed']}/{bmd_results['total']}")
+                st.write("Distribution:")
+                for class_name, count in bmd_results["class_counts"].items():
+                    st.write(f"- {class_name}: {count} documents")
+                fig, ax = plt.subplots()
+                ax.pie(bmd_results["class_counts"].values(), 
+                       labels=bmd_results["class_counts"].keys(), 
+                       autopct='%1.1f%%')
+                ax.set_title("BMD Distribution")
+                st.pyplot(fig)
                 
-                if use_bmd and bmd_model and bmd_results["file_results"]:
-                    st.subheader("BMD Classification Summary")
-                    st.write(f"Total Documents Processed: {bmd_results['processed']}/{bmd_results['total']}")
-                    st.write("Distribution:")
-                    for class_name, count in bmd_results["class_counts"].items():
-                        st.write(f"- {class_name}: {count} documents")
-                    fig, ax = plt.subplots()
-                    ax.pie(bmd_results["class_counts"].values(), 
-                          labels=bmd_results["class_counts"].keys(), 
-                          autopct='%1.1f%%')
-                    ax.set_title("BMD Distribution")
-                    st.pyplot(fig)
+            if use_layout and layout_model and layout_results["file_results"]:
+                st.subheader("Layout Classification Summary")
+                st.write(f"Total Documents Processed: {layout_results['processed']}/{layout_results['total']}")
+                st.write(f"Uncertain Classifications: {layout_results['uncertain']}")
+                st.write("Distribution of Confident Classifications:")
+                for class_name, count in layout_results["class_counts"].items():
+                    st.write(f"- {class_name}: {count} documents")
+                layout_counts = layout_results["class_counts"].copy()
+                layout_counts["uncertain"] = layout_results["uncertain"]
+                fig, ax = plt.subplots()
+                ax.pie(layout_counts.values(), 
+                       labels=layout_counts.keys(), 
+                       autopct='%1.1f%%')
+                ax.set_title("Layout Distribution")
+                st.pyplot(fig)
                 
-                if use_layout and layout_model and layout_results["file_results"]:
-                    st.subheader("Layout Classification Summary")
-                    st.write(f"Total Documents Processed: {layout_results['processed']}/{layout_results['total']}")
-                    st.write(f"Uncertain Classifications: {layout_results['uncertain']}")
-                    st.write("Distribution of Confident Classifications:")
-                    for class_name, count in layout_results["class_counts"].items():
-                        st.write(f"- {class_name}: {count} documents")
-                    layout_counts = layout_results["class_counts"].copy()
-                    layout_counts["uncertain"] = layout_results["uncertain"]
-                    fig, ax = plt.subplots()
-                    ax.pie(layout_counts.values(), 
-                          labels=layout_counts.keys(), 
-                          autopct='%1.1f%%')
-                    ax.set_title("Layout Distribution")
-                    st.pyplot(fig)
+                # Create and offer download of classified results as a zip
+                st.subheader("Download Classified Results")
+                result_zip_path = create_zip_from_folder(output_base, "classified_results.zip")
+                with open(result_zip_path, "rb") as f:
+                    st.download_button(
+                        label="Download Classified Documents as Zip",
+                        data=f,
+                        file_name="classified_results.zip",
+                        mime="application/zip"
+                    )
+                shutil.rmtree(os.path.dirname(result_zip_path))  # Clean up temp zip dir
 
     with tab3:
         st.subheader("About")
