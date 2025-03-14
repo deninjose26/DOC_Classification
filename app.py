@@ -6,6 +6,7 @@ from PIL import Image
 import os
 import shutil
 import zipfile
+import urllib.request
 import numpy as np
 from pathlib import Path
 import pandas as pd
@@ -21,7 +22,7 @@ st.set_page_config(
 
 # Application title and description
 st.title("📄 Document Type Classifier")
-st.markdown("Upload images of documents or process a zip file to classify them by document type and layout.")
+st.markdown("Upload a single image or provide a URL to a zip file containing documents to classify them by type and layout.")
 
 # Model configurations
 class BMDConfig:
@@ -51,12 +52,13 @@ def load_bmd_model():
         
         if os.path.exists(BMDConfig.model_path):
             model.load_state_dict(torch.load(BMDConfig.model_path, map_location=DEVICE))
-            model.eval()
-            model.to(DEVICE)
-            return model
         else:
-            st.warning(f"BMD Model file '{BMDConfig.model_path}' not found!")
-            return None
+            st.warning(f"BMD Model file '{BMDConfig.model_path}' not found! Attempting to download...")
+            urllib.request.urlretrieve("YOUR_BMD_MODEL_URL", BMDConfig.model_path)  # Replace with actual URL
+            model.load_state_dict(torch.load(BMDConfig.model_path, map_location=DEVICE))
+        model.eval()
+        model.to(DEVICE)
+        return model
     except Exception as e:
         st.error(f"Error loading BMD model: {e}")
         return None
@@ -80,16 +82,17 @@ def load_layout_model():
         model = DocumentClassifier(num_classes=LayoutConfig.num_classes)
         if os.path.exists(LayoutConfig.model_path):
             checkpoint = torch.load(LayoutConfig.model_path, map_location=DEVICE)
-            if 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'])
-            else:
-                model.load_state_dict(checkpoint)
-            model.eval()
-            model.to(DEVICE)
-            return model
         else:
-            st.warning(f"Layout Model file '{LayoutConfig.model_path}' not found!")
-            return None
+            st.warning(f"Layout Model file '{LayoutConfig.model_path}' not found! Attempting to download...")
+            urllib.request.urlretrieve("YOUR_LAYOUT_MODEL_URL", LayoutConfig.model_path)  # Replace with actual URL
+            checkpoint = torch.load(LayoutConfig.model_path, map_location=DEVICE)
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+        model.eval()
+        model.to(DEVICE)
+        return model
     except Exception as e:
         st.error(f"Error loading Layout model: {e}")
         return None
@@ -141,8 +144,8 @@ def predict_layout(model, image):
                      for i in range(len(LayoutConfig.class_names))}
     return predicted_class, confidence, all_probs
 
-# Zip file processing
-def process_zip(bmd_model, layout_model, zip_file, output_folder, confidence_threshold=50.0):
+# Process images from a zip file URL
+def process_zip_from_url(bmd_model, layout_model, zip_url, output_folder, confidence_threshold=50.0):
     output_base = os.path.join(output_folder, "Classified_Documents")
     os.makedirs(output_base, exist_ok=True)
     
@@ -154,21 +157,34 @@ def process_zip(bmd_model, layout_model, zip_file, output_folder, confidence_thr
                       "class_counts": {name: 0 for name in LayoutConfig.class_names}, 
                       "uncertain": 0, "file_results": []}
     
-    if not zip_file:
-        return bmd_results, layout_results, "No zip file uploaded."
+    if not zip_url:
+        return bmd_results, layout_results, "No zip URL provided.", output_base
     
-    # Extract zip to a temp directory
+    # Download and extract zip
     temp_extract_dir = tempfile.mkdtemp()
-    with zipfile.ZipFile(zip_file, 'r') as zip_ref:
-        zip_ref.extractall(temp_extract_dir)
+    zip_path = os.path.join(temp_extract_dir, "downloaded.zip")
+    try:
+        with st.spinner("Downloading zip file..."):
+            urllib.request.urlretrieve(zip_url, zip_path)
+    except Exception as e:
+        shutil.rmtree(temp_extract_dir)
+        return bmd_results, layout_results, f"Failed to download zip: {e}", output_base
     
-    # Gather all image files from the extracted contents
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            with st.spinner("Extracting zip file..."):
+                zip_ref.extractall(temp_extract_dir)
+    except Exception as e:
+        shutil.rmtree(temp_extract_dir)
+        return bmd_results, layout_results, f"Failed to extract zip: {e}", output_base
+    
+    # Gather all image files
     image_files = [os.path.join(root, f) for root, _, files in os.walk(temp_extract_dir) 
                    for f in files if f.lower().endswith(tuple(BMDConfig.supported_extensions))]
     
     if not image_files:
         shutil.rmtree(temp_extract_dir)
-        return bmd_results, layout_results, "No supported image files found in zip."
+        return bmd_results, layout_results, "No supported image files found in zip.", output_base
     
     bmd_results["total"] = len(image_files)
     layout_results["total"] = len(image_files)
@@ -239,16 +255,14 @@ def process_zip(bmd_model, layout_model, zip_file, output_folder, confidence_thr
                 'error': str(e)
             })
     
-    # Clean up extracted temp directory
     shutil.rmtree(temp_extract_dir)
-    
-    return bmd_results, layout_results, f"Processed {len(image_files)} files from zip."
+    return bmd_results, layout_results, f"Processed {len(image_files)} files from zip.", output_base
 
 # Main application
 def main():
     bmd_model, layout_model = load_models()
     
-    tab1, tab2, tab3 = st.tabs(["Upload Single Image", "Process Zip File", "About"])
+    tab1, tab2, tab3 = st.tabs(["Upload Single Image", "Process Zip from URL", "About"])
     
     with st.sidebar:
         st.subheader("Model Settings")
@@ -291,24 +305,24 @@ def main():
                         st.pyplot(fig)
 
     with tab2:
-        st.subheader("Upload Zip File of Documents")
-        zip_file = st.file_uploader("Upload a zip file containing images", type=["zip"])
+        st.subheader("Process Documents from Zip URL")
+        st.markdown("Provide a direct URL to a zip file containing your images (e.g., from Google Drive or Dropbox).")
+        zip_url = st.text_input("Zip File URL", "")
         
-        # Use a temporary directory for output
         output_folder = tempfile.mkdtemp()
         st.write(f"Output will be processed in a temporary folder: {output_folder}")
         
         confidence_threshold = st.slider("Confidence Threshold for Layout (%)", 0.0, 100.0, 50.0)
-        process_button = st.button("Process Zip", disabled=not zip_file)
+        process_button = st.button("Process Zip from URL", disabled=not zip_url)
         
         if process_button:
             global progress_bar, status_text
             progress_bar = st.progress(0)
             status_text = st.empty()
-            bmd_results, layout_results, message = process_zip(
+            bmd_results, layout_results, message, output_base = process_zip_from_url(
                 bmd_model if use_bmd else None,
                 layout_model if use_layout else None,
-                zip_file,
+                zip_url,
                 output_folder,
                 confidence_threshold
             )
@@ -343,7 +357,6 @@ def main():
                 ax.set_title("Layout Distribution")
                 st.pyplot(fig)
                 
-                # Provide download options for processed files
                 st.subheader("Download Classified Files")
                 for bmd_class in BMDConfig.class_names:
                     for layout_class in LayoutConfig.class_names + ['uncertain']:
