@@ -242,13 +242,12 @@ def main():
     
     with tab1:
         uploaded_file = st.file_uploader("Upload a document image", type=["jpg", "jpeg", "png", "bmp"])
-        camera_input = st.camera_input("Or capture a document")
+        
         
         image = None
         if uploaded_file:
             image = Image.open(uploaded_file).convert('RGB')
-        elif camera_input:
-            image = Image.open(camera_input).convert('RGB')
+        
         
         if image:
             st.image(image, caption="Document Image", use_column_width=True)
