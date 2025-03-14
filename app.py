@@ -246,11 +246,21 @@ def process_zip(bmd_model, layout_model, zip_file, output_folder, confidence_thr
     return bmd_results, layout_results, f"Processed {len(image_files)} files from zip.", output_base
 
 # Create a zip file from a folder
-def create_zip_from_folder(folder_path, zip_name):
+def create_zip_from_folder(folder_path):
+    if not os.path.exists(folder_path):
+        st.error(f"Folder to zip does not exist: {folder_path}")
+        return None
     temp_zip_dir = tempfile.mkdtemp()
-    zip_path = os.path.join(temp_zip_dir, zip_name)
-    shutil.make_archive(zip_path.replace('.zip', ''), 'zip', folder_path)
-    return zip_path + '.zip'
+    zip_base_name = os.path.join(temp_zip_dir, "classified_results")
+    try:
+        zip_path = shutil.make_archive(zip_base_name, 'zip', folder_path)
+        return zip_path
+    except Exception as e:
+        st.error(f"Failed to create zip: {e}")
+        return None
+    finally:
+        if os.path.exists(temp_zip_dir):
+            shutil.rmtree(temp_zip_dir)
 
 # Main application
 def main():
@@ -353,15 +363,17 @@ def main():
                 
                 # Create and offer download of classified results as a zip
                 st.subheader("Download Classified Results")
-                result_zip_path = create_zip_from_folder(output_base, "classified_results.zip")
-                with open(result_zip_path, "rb") as f:
-                    st.download_button(
-                        label="Download Classified Documents as Zip",
-                        data=f,
-                        file_name="classified_results.zip",
-                        mime="application/zip"
-                    )
-                shutil.rmtree(os.path.dirname(result_zip_path))  # Clean up temp zip dir
+                result_zip_path = create_zip_from_folder(output_base)
+                if result_zip_path and os.path.exists(result_zip_path):
+                    with open(result_zip_path, "rb") as f:
+                        st.download_button(
+                            label="Download Classified Documents as Zip",
+                            data=f,
+                            file_name="classified_results.zip",
+                            mime="application/zip"
+                        )
+                else:
+                    st.error("Failed to create the results zip file. Check logs for details.")
 
     with tab3:
         st.subheader("About")
